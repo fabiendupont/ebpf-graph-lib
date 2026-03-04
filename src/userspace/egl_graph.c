@@ -12,10 +12,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #define EGL_PIN_BASE "/sys/fs/bpf/egl"
+
+struct egl_node_info {
+    char *bpf_obj_path;
+    char *prog_name;
+};
 
 struct egl_graph {
     char *name;
@@ -24,6 +30,7 @@ struct egl_graph {
     int stats_fd;
     struct bpf_object **node_objs;
     int *node_fds;
+    struct egl_node_info *node_info;
     /* Adjacency matrix for DAG validation: edges[from * max_nodes + to] */
     unsigned char *edges;
     char *pin_dir;
@@ -78,13 +85,16 @@ struct egl_graph *egl_graph_create(const char *name, int max_nodes)
     g->node_fds = calloc((size_t)mn, sizeof(*g->node_fds));
     if (g->node_fds == NULL) { goto err_fds; }
 
+    g->node_info = calloc((size_t)mn, sizeof(*g->node_info));
+    if (g->node_info == NULL) { goto err_info; }
+
     for (int i = 0; i < mn; i++) {
         g->node_fds[i] = -1;
     }
 
     edge_sz = (size_t)mn * (size_t)mn;
     g->edges = calloc(edge_sz, sizeof(*g->edges));
-    if (g->edges == NULL) { goto err_edges; }
+    if (g->edges == NULL) { goto err_edges_alloc; }
 
     /* Build pin directory path */
     {
@@ -98,7 +108,9 @@ struct egl_graph *egl_graph_create(const char *name, int max_nodes)
 
 err_pin:
     free(g->edges);
-err_edges:
+err_edges_alloc:
+    free(g->node_info);
+err_info:
     free(g->node_fds);
 err_fds:
     free(g->node_objs);
@@ -176,7 +188,8 @@ int egl_graph_add_node(struct egl_graph *g, int index,
     obj = bpf_object__open(bpf_obj_path);
     if (obj == NULL) { return -errno; }
 
-    /* Reuse shared maps: prog_array and stats */
+    /* Reuse shared maps: prog_array, stats, and any previously pinned
+     * application maps (fib4, neigh4, iface_mac, tx_ports, etc.) */
     bpf_object__for_each_map(map, obj) {
         const char *map_name = bpf_map__name(map);
 
@@ -186,11 +199,50 @@ int egl_graph_add_node(struct egl_graph *g, int index,
         } else if (strcmp(map_name, "egl_node_stats") == 0) {
             ret = bpf_map__reuse_fd(map, g->stats_fd);
             if (ret < 0) { goto err_close; }
+        } else {
+            /* Try to reuse a previously pinned map */
+            char pin_path[512];
+            int pinned_fd;
+
+            (void)snprintf(pin_path, sizeof(pin_path),
+                           "%s/%s", g->pin_dir, map_name);
+            pinned_fd = bpf_obj_get(pin_path);
+            if (pinned_fd >= 0) {
+                ret = bpf_map__reuse_fd(map, pinned_fd);
+                close(pinned_fd);
+                if (ret < 0) { goto err_close; }
+            }
         }
     }
 
     ret = bpf_object__load(obj);
     if (ret < 0) { goto err_close; }
+
+    /* Pin any new application maps that aren't already pinned */
+    bpf_object__for_each_map(map, obj) {
+        const char *map_name = bpf_map__name(map);
+        char pin_path[512];
+        int map_fd;
+
+        /* Skip maps managed by ensure_maps() */
+        if (strcmp(map_name, "egl_prog_array") == 0) { continue; }
+        if (strcmp(map_name, "egl_node_stats") == 0) { continue; }
+
+        (void)snprintf(pin_path, sizeof(pin_path),
+                       "%s/%s", g->pin_dir, map_name);
+
+        /* Only pin if not already pinned */
+        map_fd = bpf_obj_get(pin_path);
+        if (map_fd >= 0) {
+            close(map_fd);
+            continue;
+        }
+
+        map_fd = bpf_map__fd(map);
+        if (map_fd >= 0) {
+            (void)bpf_obj_pin(map_fd, pin_path);
+        }
+    }
 
     /* Find the named program */
     prog = bpf_object__find_program_by_name(obj, prog_name);
@@ -220,6 +272,10 @@ int egl_graph_add_node(struct egl_graph *g, int index,
     g->node_objs[index] = obj;
     g->node_fds[index] = prog_fd;
 
+    /* Save load info for rollback support (FM-RECONFIG-01) */
+    g->node_info[index].bpf_obj_path = strdup(bpf_obj_path);
+    g->node_info[index].prog_name = strdup(prog_name);
+
     return 0;
 
 err_close:
@@ -244,6 +300,12 @@ int egl_graph_remove_node(struct egl_graph *g, int index)
     g->node_objs[index] = NULL;
     g->node_fds[index] = -1;
 
+    /* Free saved load info */
+    free(g->node_info[index].bpf_obj_path);
+    free(g->node_info[index].prog_name);
+    g->node_info[index].bpf_obj_path = NULL;
+    g->node_info[index].prog_name = NULL;
+
     /* Remove all edges involving this node */
     for (int i = 0; i < g->max_nodes; i++) {
         g->edges[index * g->max_nodes + i] = 0;
@@ -257,22 +319,33 @@ void egl_graph_destroy(struct egl_graph *g)
 {
     if (g == NULL) { return; }
 
-    /* Close all loaded BPF objects */
+    /* Close all loaded BPF objects and free node info */
     for (int i = 0; i < g->max_nodes; i++) {
         if (g->node_objs[i] != NULL) {
             bpf_object__close(g->node_objs[i]);
         }
+        free(g->node_info[i].bpf_obj_path);
+        free(g->node_info[i].prog_name);
     }
 
-    /* Unpin maps */
+    /* Unpin all maps in the pin directory */
     if (g->pin_dir != NULL) {
-        char path[512];
+        DIR *dir;
+        struct dirent *ent;
 
-        (void)snprintf(path, sizeof(path), "%s/egl_prog_array", g->pin_dir);
-        (void)unlink(path);
+        dir = opendir(g->pin_dir);
+        if (dir != NULL) {
+            while ((ent = readdir(dir)) != NULL) {
+                char path[512];
 
-        (void)snprintf(path, sizeof(path), "%s/egl_node_stats", g->pin_dir);
-        (void)unlink(path);
+                if (ent->d_name[0] == '.') { continue; }
+
+                (void)snprintf(path, sizeof(path),
+                               "%s/%s", g->pin_dir, ent->d_name);
+                (void)unlink(path);
+            }
+            closedir(dir);
+        }
 
         (void)rmdir(g->pin_dir);
     }
@@ -282,6 +355,7 @@ void egl_graph_destroy(struct egl_graph *g)
 
     free(g->node_objs);
     free(g->node_fds);
+    free(g->node_info);
     free(g->edges);
     free(g->pin_dir);
     free(g->name);
@@ -436,4 +510,46 @@ int egl_graph_get_stats_fd(const struct egl_graph *g)
 {
     if (g == NULL) { return -EINVAL; }
     return g->stats_fd;
+}
+
+int egl_graph_get_node_info(const struct egl_graph *g, int index,
+                            const char **bpf_obj_path,
+                            const char **prog_name)
+{
+    if (g == NULL) { return -EINVAL; }
+    if (index < 0 || index >= g->max_nodes) { return -EINVAL; }
+    if (g->node_objs[index] == NULL) { return -ENOENT; }
+
+    if (bpf_obj_path != NULL) {
+        *bpf_obj_path = g->node_info[index].bpf_obj_path;
+    }
+    if (prog_name != NULL) {
+        *prog_name = g->node_info[index].prog_name;
+    }
+
+    return 0;
+}
+
+int egl_graph_get_map_fd(const struct egl_graph *g, const char *map_name)
+{
+    char path[512];
+    int fd;
+
+    if (g == NULL || map_name == NULL) { return -EINVAL; }
+    if (g->pin_dir == NULL) { return -ENOENT; }
+
+    /* Fast path for well-known maps */
+    if (strcmp(map_name, "egl_prog_array") == 0) {
+        return g->prog_array_fd;
+    }
+    if (strcmp(map_name, "egl_node_stats") == 0) {
+        return g->stats_fd;
+    }
+
+    /* Application maps: open from pin directory */
+    (void)snprintf(path, sizeof(path), "%s/%s", g->pin_dir, map_name);
+    fd = bpf_obj_get(path);
+    if (fd < 0) { return -errno; }
+
+    return fd;
 }

@@ -129,8 +129,20 @@ static void rcu_grace_period(void)
     (void)nanosleep(&ts, NULL);
 }
 
+/*
+ * Snapshot of removed nodes for rollback (FM-RECONFIG-01).
+ * Before removing a node, we save its load info so we can
+ * re-add it if the commit fails.
+ */
+struct egl_removed_snapshot {
+    int index;
+    char *bpf_obj_path;
+    char *prog_name;
+};
+
 int egl_reconfig_commit(struct egl_graph *g)
 {
+    struct egl_removed_snapshot snapshots[EGL_MAX_STAGED];
     int ret;
     int removes_applied = 0;
     int adds_applied = 0;
@@ -146,9 +158,22 @@ int egl_reconfig_commit(struct egl_graph *g)
         return ret;
     }
 
-    /* Apply all removes first */
+    (void)memset(snapshots, 0, sizeof(snapshots));
+
+    /* Apply all removes first — snapshot node info for rollback */
     for (int i = 0; i < g_reconfig.remove_count; i++) {
-        ret = egl_graph_remove_node(g, g_reconfig.removes[i]);
+        const char *obj_path = NULL;
+        const char *pname = NULL;
+        int idx = g_reconfig.removes[i];
+
+        /* Save load info before removing (FM-RECONFIG-01) */
+        if (egl_graph_get_node_info(g, idx, &obj_path, &pname) == 0) {
+            snapshots[i].index = idx;
+            snapshots[i].bpf_obj_path = obj_path ? strdup(obj_path) : NULL;
+            snapshots[i].prog_name = pname ? strdup(pname) : NULL;
+        }
+
+        ret = egl_graph_remove_node(g, idx);
         if (ret < 0 && ret != -ENOENT) {
             goto rollback;
         }
@@ -170,22 +195,36 @@ int egl_reconfig_commit(struct egl_graph *g)
     /* Wait for RCU grace period to drain in-flight packets */
     rcu_grace_period();
 
+    /* Free snapshots — no longer needed on success */
+    for (int i = 0; i < removes_applied; i++) {
+        free(snapshots[i].bpf_obj_path);
+        free(snapshots[i].prog_name);
+    }
+
     free_staged();
     return 0;
 
 rollback:
     /* R5 (FTA): Roll back already-applied changes on failure.
-     * Undo adds first (reverse order), then undo removes. */
+     * Undo adds first (reverse order), then restore removes. */
     for (int i = adds_applied - 1; i >= 0; i--) {
         (void)egl_graph_remove_node(g, g_reconfig.adds[i].index);
     }
 
-    /* Re-add removed nodes is not possible without the original
-     * BPF object paths — those were not saved. Log the removes
-     * that were applied but cannot be rolled back.
-     * NOTE: removes_applied > 0 means the graph is in a partially
-     * modified state. The caller must handle this. */
-    (void)removes_applied;
+    /* Re-add removed nodes using saved snapshots (FM-RECONFIG-01) */
+    for (int i = removes_applied - 1; i >= 0; i--) {
+        if (snapshots[i].bpf_obj_path != NULL &&
+            snapshots[i].prog_name != NULL) {
+            (void)egl_graph_add_node(g, snapshots[i].index,
+                                     snapshots[i].bpf_obj_path,
+                                     snapshots[i].prog_name);
+        }
+    }
+
+    for (int i = 0; i < removes_applied; i++) {
+        free(snapshots[i].bpf_obj_path);
+        free(snapshots[i].prog_name);
+    }
 
     free_staged();
     return ret;
