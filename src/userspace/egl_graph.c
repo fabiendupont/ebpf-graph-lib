@@ -512,6 +512,15 @@ int egl_graph_get_stats_fd(const struct egl_graph *g)
     return g->stats_fd;
 }
 
+int egl_graph_get_node_fd(const struct egl_graph *g, int index)
+{
+    if (g == NULL) { return -EINVAL; }
+    if (index < 0 || index >= g->max_nodes) { return -EINVAL; }
+    if (g->node_fds[index] < 0) { return -ENOENT; }
+
+    return g->node_fds[index];
+}
+
 int egl_graph_get_node_info(const struct egl_graph *g, int index,
                             const char **bpf_obj_path,
                             const char **prog_name)

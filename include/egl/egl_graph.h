@@ -71,6 +71,13 @@ int egl_graph_get_prog_array_fd(const struct egl_graph *g);
 int egl_graph_get_stats_fd(const struct egl_graph *g);
 
 /*
+ * Get the BPF program fd for a loaded node.
+ * Returns the fd on success, -EINVAL or -ENOENT on failure.
+ * The fd is owned by the graph — do NOT close it.
+ */
+int egl_graph_get_node_fd(const struct egl_graph *g, int index);
+
+/*
  * Get any pinned map fd by name.
  * Constructs <pin_dir>/<map_name>, calls bpf_obj_get().
  * Returns fd on success, negative errno on failure.
