@@ -1,0 +1,9 @@
+[wrap-file]
+directory = libbpf-1.5.0
+source_url = https://github.com/libbpf/libbpf/archive/refs/tags/v1.5.0.tar.gz
+source_filename = libbpf-1.5.0.tar.gz
+source_hash = 05da25a437eb285a1ab3a06cbb6b1192930b1fbbbd3b4c5bc4a85c3cccf3dedb
+patch_directory = libbpf
+
+[provide]
+libbpf = libbpf_dep

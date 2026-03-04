@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# Minimal image for running CBMC (bind-mounted) with gcc for preprocessing
+FROM docker.io/library/fedora:43
+RUN dnf install -y gcc libbpf-devel && dnf clean all

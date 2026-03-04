@@ -1,0 +1,29 @@
+# Build directories
+builddir*/
+build/
+
+# Object files
+*.o
+*.a
+*.so
+*.so.*
+*.bpf.o
+
+# Claude Code (user-local)
+.claude/
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+compile_commands.json
+
+# AI generation artifacts (local only)
+SPEC.md
+PROMPT.md
+
+# OS
+.DS_Store
+Thumbs.db
