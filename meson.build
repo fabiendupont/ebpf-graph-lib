@@ -33,6 +33,7 @@ libbpf_dep = dependency('libbpf', version: '>=1.0')
 libelf_dep = dependency('libelf')
 
 egl_inc = include_directories('include')
+egl_inc_dir = meson.current_source_dir() / 'include'
 
 # Public headers
 egl_headers = files(
