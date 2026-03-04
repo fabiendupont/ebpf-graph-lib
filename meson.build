@@ -47,9 +47,9 @@ egl_headers = files(
 
 install_headers(egl_headers, subdir: 'egl')
 
-# BPF common header (installed separately — not a public API header,
-# but needed by downstream BPF node programs)
-install_headers('src/bpf/egl_common.bpf.h', subdir: 'egl/bpf')
+# BPF common header — public API for BPF node programs.
+# Lives under include/egl/bpf/ so it resolves via -I<include>.
+install_headers('include/egl/bpf/egl_common.bpf.h', subdir: 'egl/bpf')
 
 # Userspace static library
 egl_lib = static_library('egl',

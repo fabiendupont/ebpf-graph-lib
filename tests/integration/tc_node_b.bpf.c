@@ -9,7 +9,7 @@
 #define __BPF__
 #endif
 
-#include "../../src/bpf/egl_common.bpf.h"
+#include <egl/bpf/egl_common.bpf.h>
 
 #define NODE_ID 1
 #define NEXT_NODE 2
