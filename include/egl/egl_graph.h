@@ -63,6 +63,25 @@ int egl_graph_remove_edge(struct egl_graph *g, int from, int to);
  */
 int egl_graph_add_edge_safe(struct egl_graph *g, int from, int to);
 
+/*
+ * Allocate the next available PROG_ARRAY index.
+ * Returns allocated index (>= 0) or -ENOSPC if full.
+ */
+int egl_graph_alloc_index(struct egl_graph *g);
+
+/*
+ * Allocate a specific index (for core nodes that need fixed indices).
+ * Returns 0 on success, -EEXIST if already taken, -EINVAL if out of range.
+ */
+int egl_graph_reserve_index(struct egl_graph *g, int index);
+
+/*
+ * Release a previously allocated or reserved index.
+ * The index must not have a loaded node — call egl_graph_remove_node() first.
+ * Returns 0 on success, -EBUSY if a node is loaded, -ENOENT if not reserved.
+ */
+int egl_graph_free_index(struct egl_graph *g, int index);
+
 /* Get the PROG_ARRAY map fd (for BPF programs that need to
  * reference it via bpf_map__reuse_fd) */
 int egl_graph_get_prog_array_fd(const struct egl_graph *g);

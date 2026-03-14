@@ -331,6 +331,164 @@ static void test_reconfig_remove_overflow(void)
     PASS();
 }
 
+/* alloc_index: sequential allocation */
+static void test_graph_alloc_index_sequential(void)
+{
+    struct egl_graph *g;
+    int idx;
+
+    TEST("graph_alloc_index_sequential");
+
+    g = egl_graph_create("test_alloc_seq", 4);
+    ASSERT_NOT_NULL(g);
+
+    idx = egl_graph_alloc_index(g);
+    ASSERT_EQ(idx, 0);
+    idx = egl_graph_alloc_index(g);
+    ASSERT_EQ(idx, 1);
+    idx = egl_graph_alloc_index(g);
+    ASSERT_EQ(idx, 2);
+    idx = egl_graph_alloc_index(g);
+    ASSERT_EQ(idx, 3);
+
+    /* All slots taken */
+    idx = egl_graph_alloc_index(g);
+    ASSERT_EQ(idx, -ENOSPC);
+
+    egl_graph_destroy(g);
+    PASS();
+}
+
+/* alloc_index: NULL graph */
+static void test_graph_alloc_index_null(void)
+{
+    TEST("graph_alloc_index_null");
+
+    ASSERT_EQ(egl_graph_alloc_index(NULL), -EINVAL);
+
+    PASS();
+}
+
+/* reserve_index: reserve specific slot */
+static void test_graph_reserve_index(void)
+{
+    struct egl_graph *g;
+    int ret;
+
+    TEST("graph_reserve_index");
+
+    g = egl_graph_create("test_reserve", 8);
+    ASSERT_NOT_NULL(g);
+
+    ret = egl_graph_reserve_index(g, 5);
+    ASSERT_EQ(ret, 0);
+
+    /* Double reserve should fail */
+    ret = egl_graph_reserve_index(g, 5);
+    ASSERT_EQ(ret, -EEXIST);
+
+    egl_graph_destroy(g);
+    PASS();
+}
+
+/* reserve_index: invalid args */
+static void test_graph_reserve_index_invalid(void)
+{
+    struct egl_graph *g;
+
+    TEST("graph_reserve_index_invalid");
+
+    g = egl_graph_create("test_res_inv", 8);
+    ASSERT_NOT_NULL(g);
+
+    ASSERT_EQ(egl_graph_reserve_index(NULL, 0), -EINVAL);
+    ASSERT_EQ(egl_graph_reserve_index(g, -1), -EINVAL);
+    ASSERT_EQ(egl_graph_reserve_index(g, 8), -EINVAL);
+
+    egl_graph_destroy(g);
+    PASS();
+}
+
+/* alloc skips reserved indices */
+static void test_graph_alloc_skips_reserved(void)
+{
+    struct egl_graph *g;
+    int idx;
+
+    TEST("graph_alloc_skips_reserved");
+
+    g = egl_graph_create("test_alloc_skip", 4);
+    ASSERT_NOT_NULL(g);
+
+    /* Reserve slots 0 and 2 */
+    ASSERT_EQ(egl_graph_reserve_index(g, 0), 0);
+    ASSERT_EQ(egl_graph_reserve_index(g, 2), 0);
+
+    /* alloc should return 1, then 3 */
+    idx = egl_graph_alloc_index(g);
+    ASSERT_EQ(idx, 1);
+    idx = egl_graph_alloc_index(g);
+    ASSERT_EQ(idx, 3);
+
+    /* All full now */
+    idx = egl_graph_alloc_index(g);
+    ASSERT_EQ(idx, -ENOSPC);
+
+    egl_graph_destroy(g);
+    PASS();
+}
+
+/* free_index: release and re-allocate */
+static void test_graph_free_index(void)
+{
+    struct egl_graph *g;
+    int idx;
+
+    TEST("graph_free_index");
+
+    g = egl_graph_create("test_free", 4);
+    ASSERT_NOT_NULL(g);
+
+    /* Allocate all */
+    ASSERT_EQ(egl_graph_alloc_index(g), 0);
+    ASSERT_EQ(egl_graph_alloc_index(g), 1);
+    ASSERT_EQ(egl_graph_alloc_index(g), 2);
+    ASSERT_EQ(egl_graph_alloc_index(g), 3);
+    ASSERT_EQ(egl_graph_alloc_index(g), -ENOSPC);
+
+    /* Free index 1 */
+    ASSERT_EQ(egl_graph_free_index(g, 1), 0);
+
+    /* Alloc should return 1 again */
+    idx = egl_graph_alloc_index(g);
+    ASSERT_EQ(idx, 1);
+
+    egl_graph_destroy(g);
+    PASS();
+}
+
+/* free_index: error cases */
+static void test_graph_free_index_errors(void)
+{
+    struct egl_graph *g;
+
+    TEST("graph_free_index_errors");
+
+    g = egl_graph_create("test_free_err", 8);
+    ASSERT_NOT_NULL(g);
+
+    /* Free unreserved index */
+    ASSERT_EQ(egl_graph_free_index(g, 0), -ENOENT);
+
+    /* Invalid args */
+    ASSERT_EQ(egl_graph_free_index(NULL, 0), -EINVAL);
+    ASSERT_EQ(egl_graph_free_index(g, -1), -EINVAL);
+    ASSERT_EQ(egl_graph_free_index(g, 8), -EINVAL);
+
+    egl_graph_destroy(g);
+    PASS();
+}
+
 int main(void)
 {
     printf("=== Graph Lifecycle Tests ===\n");
@@ -348,6 +506,13 @@ int main(void)
     test_reconfig_add_null_args();
     test_reconfig_add_overflow();
     test_reconfig_remove_overflow();
+    test_graph_alloc_index_sequential();
+    test_graph_alloc_index_null();
+    test_graph_reserve_index();
+    test_graph_reserve_index_invalid();
+    test_graph_alloc_skips_reserved();
+    test_graph_free_index();
+    test_graph_free_index_errors();
 
     printf("\n--- Results: %d/%d passed, %d failed ---\n",
            tests_passed, tests_run, tests_failed);

@@ -33,6 +33,8 @@ struct egl_graph {
     struct egl_node_info *node_info;
     /* Adjacency matrix for DAG validation: edges[from * max_nodes + to] */
     unsigned char *edges;
+    /* Index reservation bitmap: 1 = reserved/allocated, 0 = free */
+    unsigned char *reserved;
     char *pin_dir;
 };
 
@@ -96,6 +98,9 @@ struct egl_graph *egl_graph_create(const char *name, int max_nodes)
     g->edges = calloc(edge_sz, sizeof(*g->edges));
     if (g->edges == NULL) { goto err_edges_alloc; }
 
+    g->reserved = calloc((size_t)mn, sizeof(*g->reserved));
+    if (g->reserved == NULL) { goto err_reserved; }
+
     /* Build pin directory path */
     {
         char buf[256];
@@ -107,6 +112,8 @@ struct egl_graph *egl_graph_create(const char *name, int max_nodes)
     return g;
 
 err_pin:
+    free(g->reserved);
+err_reserved:
     free(g->edges);
 err_edges_alloc:
     free(g->node_info);
@@ -180,6 +187,11 @@ int egl_graph_add_node(struct egl_graph *g, int index,
     }
     if (index < 0 || index >= g->max_nodes) { return -EINVAL; }
     if (g->node_objs[index] != NULL) { return -EEXIST; }
+
+    /* Auto-reserve if not already reserved */
+    if (g->reserved[index] == 0) {
+        g->reserved[index] = 1;
+    }
 
     ret = ensure_maps(g);
     if (ret < 0) { return ret; }
@@ -306,6 +318,9 @@ int egl_graph_remove_node(struct egl_graph *g, int index)
     g->node_info[index].bpf_obj_path = NULL;
     g->node_info[index].prog_name = NULL;
 
+    /* Release index reservation */
+    g->reserved[index] = 0;
+
     /* Remove all edges involving this node */
     for (int i = 0; i < g->max_nodes; i++) {
         g->edges[index * g->max_nodes + i] = 0;
@@ -357,6 +372,7 @@ void egl_graph_destroy(struct egl_graph *g)
     free(g->node_fds);
     free(g->node_info);
     free(g->edges);
+    free(g->reserved);
     free(g->pin_dir);
     free(g->name);
     free(g);
@@ -498,6 +514,43 @@ int egl_graph_validate_dag(const struct egl_graph *g)
     free(in_degree);
 
     return (processed == node_count) ? 0 : -ELOOP;
+}
+
+int egl_graph_alloc_index(struct egl_graph *g)
+{
+    if (g == NULL) { return -EINVAL; }
+
+    for (int i = 0; i < g->max_nodes; i++) {
+        if (g->reserved[i] == 0) {
+            g->reserved[i] = 1;
+            return i;
+        }
+    }
+
+    return -ENOSPC;
+}
+
+int egl_graph_reserve_index(struct egl_graph *g, int index)
+{
+    if (g == NULL) { return -EINVAL; }
+    if (index < 0 || index >= g->max_nodes) { return -EINVAL; }
+    if (g->reserved[index] != 0) { return -EEXIST; }
+
+    g->reserved[index] = 1;
+
+    return 0;
+}
+
+int egl_graph_free_index(struct egl_graph *g, int index)
+{
+    if (g == NULL) { return -EINVAL; }
+    if (index < 0 || index >= g->max_nodes) { return -EINVAL; }
+    if (g->reserved[index] == 0) { return -ENOENT; }
+    if (g->node_objs[index] != NULL) { return -EBUSY; }
+
+    g->reserved[index] = 0;
+
+    return 0;
 }
 
 int egl_graph_get_prog_array_fd(const struct egl_graph *g)
