@@ -5,10 +5,12 @@
 #include <egl/egl_graph.h>
 #include <egl/egl_types.h>
 #include <egl/egl_loader.h>
+#include "egl_internal.h"
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <errno.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -17,10 +19,31 @@
 #include <unistd.h>
 
 #define EGL_PIN_BASE "/sys/fs/bpf/egl"
+#define EGL_MAX_CACHED_MAPS 32
+#define EGL_MAX_STAGED 64
 
 struct egl_node_info {
     char *bpf_obj_path;
     char *prog_name;
+};
+
+struct egl_cached_map {
+    char *name;
+    int fd;
+};
+
+struct egl_staged_add {
+    int index;
+    char *bpf_obj_path;
+    char *prog_name;
+};
+
+struct egl_reconfig_state {
+    int active;
+    struct egl_staged_add adds[EGL_MAX_STAGED];
+    int add_count;
+    int removes[EGL_MAX_STAGED];
+    int remove_count;
 };
 
 struct egl_graph {
@@ -36,6 +59,11 @@ struct egl_graph {
     /* Index reservation bitmap: 1 = reserved/allocated, 0 = free */
     unsigned char *reserved;
     char *pin_dir;
+    /* Cached application map fds — all owned by the graph */
+    struct egl_cached_map cached_maps[EGL_MAX_CACHED_MAPS];
+    int cached_map_count;
+    /* Per-graph reconfiguration state */
+    struct egl_reconfig_state reconfig;
 };
 
 static int make_pin_dir(const char *path)
@@ -365,6 +393,12 @@ void egl_graph_destroy(struct egl_graph *g)
         (void)rmdir(g->pin_dir);
     }
 
+    /* Close cached application map fds */
+    for (int i = 0; i < g->cached_map_count; i++) {
+        if (g->cached_maps[i].fd >= 0) { close(g->cached_maps[i].fd); }
+        free(g->cached_maps[i].name);
+    }
+
     if (g->prog_array_fd >= 0) { close(g->prog_array_fd); }
     if (g->stats_fd >= 0) { close(g->stats_fd); }
 
@@ -594,6 +628,9 @@ int egl_graph_get_node_info(const struct egl_graph *g, int index,
 
 int egl_graph_get_map_fd(const struct egl_graph *g, const char *map_name)
 {
+    /* Cast away const: caching is an internal detail that doesn't change
+     * the logical state visible to the caller. */
+    struct egl_graph *mg = (struct egl_graph *)(uintptr_t)g;
     char path[512];
     int fd;
 
@@ -608,10 +645,112 @@ int egl_graph_get_map_fd(const struct egl_graph *g, const char *map_name)
         return g->stats_fd;
     }
 
-    /* Application maps: open from pin directory */
+    /* Check cache first */
+    for (int i = 0; i < g->cached_map_count; i++) {
+        if (strcmp(g->cached_maps[i].name, map_name) == 0) {
+            return g->cached_maps[i].fd;
+        }
+    }
+
+    /* Application maps: open from pin directory and cache */
     (void)snprintf(path, sizeof(path), "%s/%s", g->pin_dir, map_name);
     fd = bpf_obj_get(path);
     if (fd < 0) { return -errno; }
 
+    if (mg->cached_map_count < EGL_MAX_CACHED_MAPS) {
+        mg->cached_maps[mg->cached_map_count].name = strdup(map_name);
+        if (mg->cached_maps[mg->cached_map_count].name != NULL) {
+            mg->cached_maps[mg->cached_map_count].fd = fd;
+            mg->cached_map_count++;
+        }
+    }
+
     return fd;
+}
+
+int egl_graph_get_max_nodes(const struct egl_graph *g)
+{
+    if (g == NULL) { return -EINVAL; }
+    return g->max_nodes;
+}
+
+/* --- Internal reconfig state management --- */
+
+int egl_reconfig_begin_internal(struct egl_graph *g)
+{
+    if (g->reconfig.active) { return -EBUSY; }
+
+    (void)memset(&g->reconfig, 0, sizeof(g->reconfig));
+    g->reconfig.active = 1;
+
+    return 0;
+}
+
+int egl_reconfig_clear_internal(struct egl_graph *g)
+{
+    if (!g->reconfig.active) { return -EINVAL; }
+
+    for (int i = 0; i < g->reconfig.add_count; i++) {
+        free(g->reconfig.adds[i].bpf_obj_path);
+        free(g->reconfig.adds[i].prog_name);
+    }
+    (void)memset(&g->reconfig, 0, sizeof(g->reconfig));
+
+    return 0;
+}
+
+int egl_reconfig_stage_add(struct egl_graph *g, int index,
+                           const char *bpf_obj_path, const char *prog_name)
+{
+    struct egl_staged_add *sa;
+
+    if (!g->reconfig.active) { return -EINVAL; }
+    if (g->reconfig.add_count >= EGL_MAX_STAGED) { return -ENOSPC; }
+
+    sa = &g->reconfig.adds[g->reconfig.add_count];
+    sa->index = index;
+    sa->bpf_obj_path = strdup(bpf_obj_path);
+    sa->prog_name = strdup(prog_name);
+
+    if (sa->bpf_obj_path == NULL || sa->prog_name == NULL) {
+        free(sa->bpf_obj_path);
+        free(sa->prog_name);
+        return -ENOMEM;
+    }
+
+    g->reconfig.add_count++;
+    return 0;
+}
+
+int egl_reconfig_stage_remove(struct egl_graph *g, int index)
+{
+    if (!g->reconfig.active) { return -EINVAL; }
+    if (g->reconfig.remove_count >= EGL_MAX_STAGED) { return -ENOSPC; }
+
+    g->reconfig.removes[g->reconfig.remove_count++] = index;
+    return 0;
+}
+
+int egl_reconfig_get_counts(const struct egl_graph *g,
+                            int *add_count, int *remove_count)
+{
+    if (!g->reconfig.active) { return -EINVAL; }
+
+    *add_count = g->reconfig.add_count;
+    *remove_count = g->reconfig.remove_count;
+    return 0;
+}
+
+int egl_reconfig_get_remove_index(const struct egl_graph *g, int i)
+{
+    return g->reconfig.removes[i];
+}
+
+void egl_reconfig_get_add_entry(const struct egl_graph *g, int i,
+                                int *index, const char **bpf_obj_path,
+                                const char **prog_name)
+{
+    *index = g->reconfig.adds[i].index;
+    *bpf_obj_path = g->reconfig.adds[i].bpf_obj_path;
+    *prog_name = g->reconfig.adds[i].prog_name;
 }

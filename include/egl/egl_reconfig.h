@@ -6,17 +6,18 @@
 /*
  * Staged graph reconfiguration.
  *
- * Thread safety: NOT thread-safe. The reconfiguration API uses a
- * global staging area — only one reconfiguration transaction can be
- * active at a time across ALL graphs. Concurrent calls to any
- * egl_reconfig_* function from different threads will corrupt state.
+ * Thread safety: NOT thread-safe. Each egl_graph instance has its
+ * own staging area — different graphs may have independent active
+ * reconfigurations. However, concurrent calls to egl_reconfig_*
+ * functions on the SAME graph from different threads will corrupt
+ * state.
  *
- * Callers MUST serialize all reconfiguration operations externally
- * (e.g., mutex, single-threaded control plane).
+ * Callers MUST serialize all reconfiguration operations on a given
+ * graph externally (e.g., mutex, single-threaded control plane).
  *
  * egl_reconfig_begin() returns -EBUSY if a transaction is already
- * active, but this check is NOT atomic and does NOT provide thread
- * safety — it only catches sequential misuse.
+ * active on the given graph, but this check is NOT atomic and does
+ * NOT provide thread safety — it only catches sequential misuse.
  */
 
 struct egl_graph;

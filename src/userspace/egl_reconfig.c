@@ -4,89 +4,34 @@
 
 #include <egl/egl_reconfig.h>
 #include <egl/egl_graph.h>
+#include "egl_internal.h"
 
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-#define EGL_MAX_STAGED 64
 #define EGL_RCU_GRACE_MS 10
-
-struct egl_staged_add {
-    int index;
-    char *bpf_obj_path;
-    char *prog_name;
-};
-
-/* Internal accessors -- egl_graph.c exposes the reconfig state via
- * a pointer stored in struct egl_graph. For simplicity, we use the
- * public API to stage changes and commit them. */
-
-static struct {
-    int active;
-    struct egl_staged_add adds[EGL_MAX_STAGED];
-    int add_count;
-    int removes[EGL_MAX_STAGED];
-    int remove_count;
-    struct egl_graph *graph;
-} g_reconfig;
 
 int egl_reconfig_begin(struct egl_graph *g)
 {
     if (g == NULL) { return -EINVAL; }
-    if (g_reconfig.active) { return -EBUSY; }
-
-    (void)memset(&g_reconfig, 0, sizeof(g_reconfig));
-    g_reconfig.active = 1;
-    g_reconfig.graph = g;
-
-    return 0;
+    return egl_reconfig_begin_internal(g);
 }
 
 int egl_reconfig_add_node(struct egl_graph *g, int index,
                           const char *bpf_obj_path, const char *prog_name)
 {
-    struct egl_staged_add *sa;
-
     if (g == NULL || bpf_obj_path == NULL || prog_name == NULL) {
         return -EINVAL;
     }
-    if (!g_reconfig.active || g_reconfig.graph != g) { return -EINVAL; }
-    if (g_reconfig.add_count >= EGL_MAX_STAGED) { return -ENOSPC; }
-
-    sa = &g_reconfig.adds[g_reconfig.add_count];
-    sa->index = index;
-    sa->bpf_obj_path = strdup(bpf_obj_path);
-    sa->prog_name = strdup(prog_name);
-
-    if (sa->bpf_obj_path == NULL || sa->prog_name == NULL) {
-        free(sa->bpf_obj_path);
-        free(sa->prog_name);
-        return -ENOMEM;
-    }
-
-    g_reconfig.add_count++;
-    return 0;
+    return egl_reconfig_stage_add(g, index, bpf_obj_path, prog_name);
 }
 
 int egl_reconfig_remove_node(struct egl_graph *g, int index)
 {
     if (g == NULL) { return -EINVAL; }
-    if (!g_reconfig.active || g_reconfig.graph != g) { return -EINVAL; }
-    if (g_reconfig.remove_count >= EGL_MAX_STAGED) { return -ENOSPC; }
-
-    g_reconfig.removes[g_reconfig.remove_count++] = index;
-    return 0;
-}
-
-static void free_staged(void)
-{
-    for (int i = 0; i < g_reconfig.add_count; i++) {
-        free(g_reconfig.adds[i].bpf_obj_path);
-        free(g_reconfig.adds[i].prog_name);
-    }
-    (void)memset(&g_reconfig, 0, sizeof(g_reconfig));
+    return egl_reconfig_stage_remove(g, index);
 }
 
 /*
@@ -140,31 +85,37 @@ struct egl_removed_snapshot {
     char *prog_name;
 };
 
+#define EGL_MAX_STAGED 64
+
 int egl_reconfig_commit(struct egl_graph *g)
 {
     struct egl_removed_snapshot snapshots[EGL_MAX_STAGED];
+    int staged_adds;
+    int staged_removes;
     int ret;
     int removes_applied = 0;
     int adds_applied = 0;
 
     if (g == NULL) { return -EINVAL; }
-    if (!g_reconfig.active || g_reconfig.graph != g) { return -EINVAL; }
+
+    ret = egl_reconfig_get_counts(g, &staged_adds, &staged_removes);
+    if (ret < 0) { return ret; }
 
     /* R1 (FTA): Validate DAG before applying any changes.
      * This prevents committing a configuration that contains cycles. */
     ret = egl_graph_validate_dag(g);
     if (ret < 0) {
-        free_staged();
+        egl_reconfig_clear_internal(g);
         return ret;
     }
 
     (void)memset(snapshots, 0, sizeof(snapshots));
 
     /* Apply all removes first — snapshot node info for rollback */
-    for (int i = 0; i < g_reconfig.remove_count; i++) {
+    for (int i = 0; i < staged_removes; i++) {
         const char *obj_path = NULL;
         const char *pname = NULL;
-        int idx = g_reconfig.removes[i];
+        int idx = egl_reconfig_get_remove_index(g, i);
 
         /* Save load info before removing (FM-RECONFIG-01) */
         if (egl_graph_get_node_info(g, idx, &obj_path, &pname) == 0) {
@@ -181,11 +132,14 @@ int egl_reconfig_commit(struct egl_graph *g)
     }
 
     /* Apply all adds */
-    for (int i = 0; i < g_reconfig.add_count; i++) {
-        const struct egl_staged_add *sa = &g_reconfig.adds[i];
+    for (int i = 0; i < staged_adds; i++) {
+        const char *obj_path;
+        const char *pname;
+        int idx;
 
-        ret = egl_graph_add_node(g, sa->index, sa->bpf_obj_path,
-                                 sa->prog_name);
+        egl_reconfig_get_add_entry(g, i, &idx, &obj_path, &pname);
+
+        ret = egl_graph_add_node(g, idx, obj_path, pname);
         if (ret < 0) {
             goto rollback;
         }
@@ -201,14 +155,19 @@ int egl_reconfig_commit(struct egl_graph *g)
         free(snapshots[i].prog_name);
     }
 
-    free_staged();
+    egl_reconfig_clear_internal(g);
     return 0;
 
 rollback:
     /* R5 (FTA): Roll back already-applied changes on failure.
      * Undo adds first (reverse order), then restore removes. */
     for (int i = adds_applied - 1; i >= 0; i--) {
-        (void)egl_graph_remove_node(g, g_reconfig.adds[i].index);
+        int idx;
+        const char *unused1;
+        const char *unused2;
+
+        egl_reconfig_get_add_entry(g, i, &idx, &unused1, &unused2);
+        (void)egl_graph_remove_node(g, idx);
     }
 
     /* Re-add removed nodes using saved snapshots (FM-RECONFIG-01) */
@@ -226,15 +185,12 @@ rollback:
         free(snapshots[i].prog_name);
     }
 
-    free_staged();
+    egl_reconfig_clear_internal(g);
     return ret;
 }
 
 int egl_reconfig_abort(struct egl_graph *g)
 {
     if (g == NULL) { return -EINVAL; }
-    if (!g_reconfig.active || g_reconfig.graph != g) { return -EINVAL; }
-
-    free_staged();
-    return 0;
+    return egl_reconfig_clear_internal(g);
 }

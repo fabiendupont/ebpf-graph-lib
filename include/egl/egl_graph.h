@@ -100,9 +100,12 @@ int egl_graph_get_node_fd(const struct egl_graph *g, int index);
  * Get any pinned map fd by name.
  * Constructs <pin_dir>/<map_name>, calls bpf_obj_get().
  * Returns fd on success, negative errno on failure.
- * The caller does NOT own the returned fd — do NOT close it.
+ * The fd is owned by the graph (cached internally) — do NOT close it.
  */
 int egl_graph_get_map_fd(const struct egl_graph *g, const char *map_name);
+
+/* Get the max_nodes capacity of the graph. */
+int egl_graph_get_max_nodes(const struct egl_graph *g);
 
 /*
  * Get the BPF object path and program name for a loaded node.

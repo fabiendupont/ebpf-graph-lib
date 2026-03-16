@@ -489,6 +489,73 @@ static void test_graph_free_index_errors(void)
     PASS();
 }
 
+/* get_max_nodes accessor */
+static void test_graph_get_max_nodes(void)
+{
+    struct egl_graph *g;
+
+    TEST("graph_get_max_nodes");
+
+    g = egl_graph_create("test_mn", 42);
+    ASSERT_NOT_NULL(g);
+
+    ASSERT_EQ(egl_graph_get_max_nodes(g), 42);
+    ASSERT_EQ(egl_graph_get_max_nodes(NULL), -EINVAL);
+
+    egl_graph_destroy(g);
+    PASS();
+}
+
+/* get_max_nodes with default */
+static void test_graph_get_max_nodes_default(void)
+{
+    struct egl_graph *g;
+
+    TEST("graph_get_max_nodes_default");
+
+    g = egl_graph_create("test_mn_def", 0);
+    ASSERT_NOT_NULL(g);
+
+    ASSERT_EQ(egl_graph_get_max_nodes(g), 256);
+
+    egl_graph_destroy(g);
+    PASS();
+}
+
+/* Per-graph reconfig: two graphs can have independent reconfigs */
+static void test_reconfig_per_graph(void)
+{
+    struct egl_graph *g1;
+    struct egl_graph *g2;
+    int ret;
+
+    TEST("reconfig_per_graph");
+
+    g1 = egl_graph_create("test_rc1", 8);
+    ASSERT_NOT_NULL(g1);
+
+    g2 = egl_graph_create("test_rc2", 8);
+    ASSERT_NOT_NULL(g2);
+
+    /* Begin reconfig on g1 */
+    ret = egl_reconfig_begin(g1);
+    ASSERT_EQ(ret, 0);
+
+    /* Begin reconfig on g2 should also succeed (no longer global) */
+    ret = egl_reconfig_begin(g2);
+    ASSERT_EQ(ret, 0);
+
+    /* Double begin on g1 should fail */
+    ret = egl_reconfig_begin(g1);
+    ASSERT_EQ(ret, -EBUSY);
+
+    (void)egl_reconfig_abort(g1);
+    (void)egl_reconfig_abort(g2);
+    egl_graph_destroy(g1);
+    egl_graph_destroy(g2);
+    PASS();
+}
+
 int main(void)
 {
     printf("=== Graph Lifecycle Tests ===\n");
@@ -513,6 +580,9 @@ int main(void)
     test_graph_alloc_skips_reserved();
     test_graph_free_index();
     test_graph_free_index_errors();
+    test_graph_get_max_nodes();
+    test_graph_get_max_nodes_default();
+    test_reconfig_per_graph();
 
     printf("\n--- Results: %d/%d passed, %d failed ---\n",
            tests_passed, tests_run, tests_failed);
