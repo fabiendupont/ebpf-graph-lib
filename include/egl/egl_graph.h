@@ -29,6 +29,18 @@ struct egl_graph;
 struct egl_graph *egl_graph_create(const char *name, int max_nodes);
 
 /*
+ * Create a graph that shares a PROG_ARRAY with other graphs via BPF pinning.
+ * If the pin path exists, opens the existing PROG_ARRAY (join).
+ * If it does not exist, creates and pins a new one (first creator).
+ * This enables cross-project composition: multiple projects register
+ * nodes into a single shared PROG_ARRAY and can tail-call between them.
+ * Use egl_graph_reserve_index() for fixed indices, egl_graph_alloc_index()
+ * for dynamic ones. NULL pin_path behaves like egl_graph_create().
+ */
+struct egl_graph *egl_graph_create_shared(const char *name, int max_nodes,
+                                          const char *prog_array_pin_path);
+
+/*
  * Add a node (loads BPF ELF, inserts prog fd into PROG_ARRAY at index).
  * Works for any BPF program type -- the graph doesn't care if it's
  * XDP, TC, or something else.

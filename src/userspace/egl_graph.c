@@ -59,12 +59,17 @@ struct egl_graph {
     /* Index reservation bitmap: 1 = reserved/allocated, 0 = free */
     unsigned char *reserved;
     char *pin_dir;
+    /* Shared PROG_ARRAY pin path (NULL = create own, non-NULL = join/create) */
+    char *shared_prog_array_path;
     /* Cached application map fds — all owned by the graph */
     struct egl_cached_map cached_maps[EGL_MAX_CACHED_MAPS];
     int cached_map_count;
     /* Per-graph reconfiguration state */
     struct egl_reconfig_state reconfig;
 };
+
+/* Forward declaration for use in egl_graph_create_shared */
+void egl_graph_destroy(struct egl_graph *g);
 
 static int make_pin_dir(const char *path)
 {
@@ -156,11 +161,39 @@ err_name:
     return NULL;
 }
 
+struct egl_graph *egl_graph_create_shared(const char *name, int max_nodes,
+                                          const char *prog_array_pin_path)
+{
+    struct egl_graph *g;
+
+    g = egl_graph_create(name, max_nodes);
+    if (g == NULL)
+        return NULL;
+
+    if (prog_array_pin_path != NULL) {
+        g->shared_prog_array_path = strdup(prog_array_pin_path);
+        if (g->shared_prog_array_path == NULL) {
+            egl_graph_destroy(g);
+            return NULL;
+        }
+    }
+
+    return g;
+}
+
 static int ensure_maps(struct egl_graph *g)
 {
     LIBBPF_OPTS(bpf_map_create_opts, opts);
 
     if (g->prog_array_fd >= 0) { return 0; }
+
+    /* Shared mode: try to open existing pinned PROG_ARRAY first */
+    if (g->shared_prog_array_path != NULL) {
+        g->prog_array_fd = bpf_obj_get(g->shared_prog_array_path);
+        if (g->prog_array_fd >= 0)
+            goto create_stats;
+        /* Pin doesn't exist yet — create and pin below */
+    }
 
     /* Create PROG_ARRAY */
     g->prog_array_fd = bpf_map_create(BPF_MAP_TYPE_PROG_ARRAY,
@@ -169,6 +202,18 @@ static int ensure_maps(struct egl_graph *g)
                                        (__u32)g->max_nodes, &opts);
     if (g->prog_array_fd < 0) { return -errno; }
 
+    /* Pin shared PROG_ARRAY if path specified */
+    if (g->shared_prog_array_path != NULL) {
+        int pin_ret = bpf_obj_pin(g->prog_array_fd,
+                                  g->shared_prog_array_path);
+        if (pin_ret < 0 && errno != EEXIST) {
+            close(g->prog_array_fd);
+            g->prog_array_fd = -1;
+            return -errno;
+        }
+    }
+
+create_stats:
     /* Create PERCPU_ARRAY for stats */
     g->stats_fd = bpf_map_create(BPF_MAP_TYPE_PERCPU_ARRAY,
                                   "egl_node_stats",
@@ -408,6 +453,7 @@ void egl_graph_destroy(struct egl_graph *g)
     free(g->edges);
     free(g->reserved);
     free(g->pin_dir);
+    free(g->shared_prog_array_path);
     free(g->name);
     free(g);
 }
