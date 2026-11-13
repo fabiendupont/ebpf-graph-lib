@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           dnf install -y git meson ninja-build gcc clang libbpf-devel \
-            libelf-devel pkgconf-pkg-config iproute
+            elfutils-libelf-devel pkgconf-pkg-config iproute
       - uses: actions/checkout@v4
       - name: Build
         run: |
