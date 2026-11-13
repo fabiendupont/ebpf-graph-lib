@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# CI for ebpf-graph-lib: build + unit tests (current Fedora) and the
+# privileged tc_pipeline integration test (loads real BPF programs;
+# GitHub ubuntu runners allow root, unlike the previous CI
+# environment where it was skipped).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    container: fedora:45
+    steps:
+      - name: Install dependencies
+        run: |
+          dnf install -y git meson ninja-build gcc clang libbpf-devel \
+            libelf-devel pkgconf-pkg-config iproute
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          meson setup builddir
+          meson compile -C builddir
+      - name: Tests
+        # tc_pipeline skips gracefully without CAP_BPF; the
+        # privileged job below runs it for real.
+        run: meson test -C builddir -v --print-errorlogs
+
+  # The tc_pipeline test loads the tc_node_* BPF programs and runs
+  # frames through the graph — needs root.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq meson ninja-build gcc clang \
+            libbpf-dev libelf-dev pkg-config iproute2 >/dev/null
+          # clang -target bpf does not search the multiarch include
+          # dir where the kernel UAPI headers' <asm/types.h> lives.
+          sudo ln -sf x86_64-linux-gnu/asm /usr/include/asm
+      - name: Build
+        run: |
+          meson setup builddir
+          meson compile -C builddir
+      - name: tc_pipeline (root)
+        run: sudo -E meson test -C builddir tc_pipeline -v --print-errorlogs
